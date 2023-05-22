@@ -1,4 +1,4 @@
-import { EngineIOHandler, HttpRequest, HttpRequestHandler, HttpResponse, MixinProvider, Refresh, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedInterfaceProperty } from '@scrypted/sdk';
+import { EngineIOHandler, FFmpegInput, HttpRequest, HttpRequestHandler, HttpResponse, MixinProvider, Refresh, ScryptedDevice, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedInterfaceProperty, ScryptedMimeTypes, VideoCamera } from '@scrypted/sdk';
 import sdk from '@scrypted/sdk';
 import type { SmartHomeV1DisconnectRequest, SmartHomeV1DisconnectResponse, SmartHomeV1ExecuteRequest, SmartHomeV1ExecuteResponse, SmartHomeV1ExecuteResponseCommands } from 'actions-on-google/dist/service/smarthome/api/v1';
 import { supportedTypes } from './common';
@@ -11,14 +11,21 @@ import type { homegraph_v1 } from "@googleapis/homegraph/v1"
 import { GoogleAuth } from "google-auth-library"
 
 import { commandHandlers } from './handlers';
-import { canAccess } from './commands/camerastream';
+import { cameraTokens, canAccess } from './commands/camerastream';
 
 import { URL } from 'url';
 import { homegraph } from '@googleapis/homegraph';
 import type { JSONClient } from 'google-auth-library/build/src/auth/googleauth';
 import { createBrowserSignalingSession } from "@scrypted/common/src/rtc-connect";
 
+import { startFFMPegFragmentedMP4Session } from '../../../common/src/ffmpeg-mp4-parser-session';
+import child_process from 'child_process';
+
 import ciao, { Protocol } from '@homebridge/ciao';
+import { ffmpegLogInitialOutput, safeKillFFmpeg, safePrintFFmpegArguments } from '@scrypted/common/src/media-helpers';
+import { closeQuiet, listenZeroSingleClient } from '@scrypted/common/src/listen-cluster';
+import net from 'net';
+import { once } from 'events';
 
 const responder = ciao.getResponder();
 
@@ -508,11 +515,135 @@ class GoogleHome extends ScryptedDeviceBase implements HttpRequestHandler, Engin
         this.console.log(JSON.stringify(response.data));
     }
 
+    datas = new Map<string, {
+        data: Buffer[],
+        cp: child_process.ChildProcess,
+    }>();
     async onRequest(request: HttpRequest, response: HttpResponse): Promise<void> {
         if (request.url.endsWith('/identify')) {
             response.send('identify', {
                 code: 200,
             });
+            return;
+        }
+
+        const url = new URL(request.url, 'https://localhost');
+        if (url.pathname.endsWith('.mp4')) {
+            const token = url.pathname.split('/').pop().split('.mp4')[0];
+            const cameraId = cameraTokens[token];
+            if (!cameraId) {
+                response.send('', {
+                    code: 404,
+                });
+                return;
+            }
+
+            const sendData = async () => {
+                this.console.log(request.headers);
+                const range = request.headers['range'];
+                const [start, end] = range?.split('=')[1].split('-') || [];
+                const length = parseInt(end) - parseInt(start) + 1;
+                const entry = this.datas.get(token);
+                let available = Buffer.concat(entry.data);
+                if (length && length < 10000) {
+                    while (available.length < length) {
+                        const [n] = await once(entry.cp.stdio[3], 'data');
+                        available = Buffer.concat([available, n]);
+                    }
+                    const need = available.slice(0, length);
+                    response.send(need, {
+                        code: 206,
+                        headers: {
+                            'Content-Range': `bytes ${start}-${end}/99999999`,
+                            'Content-Length': length.toString(),
+                            'Content-Type': 'video/mp4',
+                        }
+                    })
+                }
+                else {
+                    const server = await listenZeroSingleClient();
+                    const client = net.connect(server.port, '127.0.0.1');
+                    const serverSocket = await server.clientPromise;
+
+                    let available = Buffer.concat(entry.data);
+                    client.write(available);
+                    entry.cp.stdio[3].pipe(client);
+
+                    response.sendSocket(serverSocket, {
+                        headers: {
+                            'Content-Range': `bytes ${start}-${end}/99999999`,
+                            'Content-Type': 'video/mp4',
+                        }
+                    });
+                }
+            }
+
+            if (this.datas.get(token)) {
+                await sendData();
+                return;
+            }
+
+            try {
+                const camera = systemManager.getDeviceById<VideoCamera>(cameraId);
+                const mo = await camera.getVideoStream({
+                    destination: 'medium-resolution',
+                });
+
+                const ffmpegInput = await sdk.mediaManager.convertMediaObjectToJSON<FFmpegInput>(mo, ScryptedMimeTypes.FFmpegInput);
+                const console = sdk.deviceManager.getMixinConsole(mo.sourceId);
+
+                const args = ffmpegInput.inputArguments.slice();
+                args.push(
+                    '-vcodec', 'copy',
+                    '-acodec', 'aac',
+                    '-profile:a', 'aac_low',
+                    '-movflags', 'frag_keyframe+empty_moov+default_base_moof+skip_sidx+skip_trailer',
+                    '-f', 'mp4',
+                    'pipe:3',
+                );
+
+                args.unshift('-hide_banner');
+                safePrintFFmpegArguments(console, args);
+
+                // const server = await listenZeroSingleClient();
+                // const client = net.connect(server.port, '127.0.0.1');
+                // const serverSocket = await server.clientPromise;
+
+                const cp = child_process.spawn(await sdk.mediaManager.getFFmpegPath(), args, {
+                    stdio: ['pipe', 'pipe', 'pipe', 'pipe',]
+                });
+
+                const alldata: Buffer[] = [];
+                cp.stdio[3].on('data', data => {
+                    alldata.push(data);
+                });
+                this.datas.set(token, {
+                    data: alldata,
+                    cp,
+                });
+
+                await sendData();
+
+                // cp.stdio[3].pipe(client);
+                // ffmpegLogInitialOutput(console, cp);
+                // cp.on('exit', () => {
+                //     serverSocket.destroy();
+                //     client.destroy();
+                // });
+                // serverSocket.on('close', () => safeKillFFmpeg(cp));
+
+                // response.sendSocket(serverSocket, {
+                //     headers: {
+                //         'Content-Type': 'video/mp4',
+                //     }
+                // });
+            }
+            catch (e) {
+                this.console.error(`request error`, e);
+                response.send(e.message, {
+                    code: 500,
+                });
+            }
             return;
         }
 
