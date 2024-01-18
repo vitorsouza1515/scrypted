@@ -14,6 +14,8 @@ from scrypted_sdk import Setting, SettingValue
 import yolo
 from predict import Prediction, PredictPlugin, Rectangle
 
+from .facenet import Facenet, BlazeFace
+
 predictExecutor = concurrent.futures.ThreadPoolExecutor(8, "CoreML-Predict")
 
 
@@ -29,9 +31,11 @@ def parse_label_contents(contents: str):
     return ret
 
 
-class CoreMLPlugin(PredictPlugin, scrypted_sdk.BufferConverter, scrypted_sdk.Settings):
+class CoreMLPlugin(PredictPlugin, scrypted_sdk.BufferConverter, scrypted_sdk.Settings, scrypted_sdk.DeviceProvider):
     def __init__(self, nativeId: str | None = None):
         super().__init__(nativeId=nativeId)
+
+        self.facedetect = None
 
         model = self.storage.getItem("model") or "Default"
         if model == "Default":
@@ -79,6 +83,8 @@ class CoreMLPlugin(PredictPlugin, scrypted_sdk.BufferConverter, scrypted_sdk.Set
                 f"{model_version}/{model}/coco_80cl.txt",
             )
 
+        labelsFile = '/Users/koush/Downloads/coco_80cl.txt'
+        modelFile = '/Users/koush/Downloads/ipcam-general-v8.mlpackage'
         self.model = ct.models.MLModel(modelFile)
 
         self.modelspec = self.model.get_spec()
@@ -93,6 +99,27 @@ class CoreMLPlugin(PredictPlugin, scrypted_sdk.BufferConverter, scrypted_sdk.Set
         self.loop = asyncio.get_event_loop()
         self.minThreshold = 0.2
 
+        asyncio.ensure_future(self.reportDevices())
+
+    async def reportDevices(self):
+        await scrypted_sdk.deviceManager.onDevicesChanged({
+            "devices": [
+                {
+                    'name': 'Face Detection',
+                    "nativeId": 'facedetect',
+                    'interfaces': [
+                        scrypted_sdk.ScryptedInterface.ObjectDetection.value,
+                    ],
+                    'type': scrypted_sdk.ScryptedDeviceType.Builtin.value,
+                }
+            ]
+        })
+
+    async def getDevice(self, nativeId: str) -> Any:
+        if nativeId == 'facedetect':
+            self.facedetect = self.facedetect or BlazeFace('facedetect')
+            return self.facedetect
+            
     async def getSettings(self) -> list[Setting]:
         model = self.storage.getItem("model") or "Default"
         return [
@@ -137,8 +164,9 @@ class CoreMLPlugin(PredictPlugin, scrypted_sdk.BufferConverter, scrypted_sdk.Set
                 out_dict = self.model.predict({input_name: input})
 
             if self.yolov8:
-                out_blob = out_dict["var_914"]
-                var_914 = out_dict["var_914"]
+                var_key = list(out_dict.keys())[0]
+                out_blob = out_dict[var_key]
+                var_914 = out_dict[var_key]
                 results = var_914[0]
                 objs = yolo.parse_yolov8(results)
                 ret = self.create_detection_result(objs, src_size, cvss)

@@ -35,7 +35,8 @@
       "interfaces": [
          "Settings",
          "ObjectDetection",
-         "ObjectDetectionPreview"
+         "ObjectDetectionPreview",
+         "DeviceProvider"
       ]
    },
    "devDependencies": {
